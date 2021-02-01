@@ -24,7 +24,6 @@
 #include <gst/gst.h>
 #include <gst/audio/audio.h>
 #include <gst/video/video.h>
-#include <gst/pbutils/pbutils.h>
 #include <gst/math-compat.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -77,9 +76,6 @@ typedef struct
   GMainLoop *loop;
   guint bus_watch;
   guint timeout;
-
-  /* missing plugin messages */
-  GList *missing;
 
   gboolean buffering;
   gboolean is_live;
@@ -231,7 +227,6 @@ play_new (gchar ** uris, const gchar * audio_sink, const gchar * video_sink,
   /* FIXME: make configurable incl. 0 for disable */
   play->timeout = g_timeout_add (100, play_timeout, play);
 
-  play->missing = NULL;
   play->buffering = FALSE;
   play->is_live = FALSE;
 
@@ -286,9 +281,6 @@ play_free (GstPlay * play)
 static void
 play_reset (GstPlay * play)
 {
-  g_list_foreach (play->missing, (GFunc) gst_message_unref, NULL);
-  play->missing = NULL;
-
   play->buffering = FALSE;
   play->is_live = FALSE;
 }
@@ -519,14 +511,6 @@ play_bus_msg (GstBus * bus, GstMessage * msg, gpointer user_data)
       break;
     }
     default:
-      if (gst_is_missing_plugin_message (msg)) {
-        gchar *desc;
-
-        desc = gst_missing_plugin_message_get_description (msg);
-        gst_print ("Missing plugin: %s\n", desc);
-        g_free (desc);
-        play->missing = g_list_append (play->missing, gst_message_ref (msg));
-      }
       break;
   }
 
