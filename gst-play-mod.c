@@ -911,11 +911,34 @@ trick_mode_get_description (GstPlayTrickMode mode)
   return "unknown trick mode";
 }
 
+static GstPlayTrickMode
+play_next_trick_mode (GstPlayTrickMode trick_mode)
+{
+  switch (trick_mode) {
+  case GST_PLAY_TRICK_MODE_NONE:
+    return GST_PLAY_TRICK_MODE_DEFAULT;
+  case GST_PLAY_TRICK_MODE_DEFAULT:
+    return GST_PLAY_TRICK_MODE_DEFAULT_NO_AUDIO;
+  case GST_PLAY_TRICK_MODE_DEFAULT_NO_AUDIO:
+    return GST_PLAY_TRICK_MODE_KEY_UNITS;
+  case GST_PLAY_TRICK_MODE_KEY_UNITS:
+    return GST_PLAY_TRICK_MODE_KEY_UNITS_NO_AUDIO;
+  case GST_PLAY_TRICK_MODE_KEY_UNITS_NO_AUDIO:
+    return GST_PLAY_TRICK_MODE_LAST;
+  case GST_PLAY_TRICK_MODE_LAST:
+    break;
+  }
+  return GST_PLAY_TRICK_MODE_NONE;
+}
+
 static void
 play_switch_trick_mode (GstPlay * play)
 {
-  GstPlayTrickMode new_mode = ++play->trick_mode;
+  GstPlayTrickMode new_mode;
   const gchar *mode_desc;
+
+  play->trick_mode = play_next_trick_mode( play->trick_mode );
+  new_mode = play->trick_mode;
 
   if (new_mode == GST_PLAY_TRICK_MODE_LAST)
     new_mode = GST_PLAY_TRICK_MODE_NONE;
