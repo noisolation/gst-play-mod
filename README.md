@@ -20,7 +20,7 @@ We needed a simple player where we could adjust the playback rate from the comma
 Make sure you have [GStreamer](https://gitlab.freedesktop.org/gstreamer) and [xcb](https://xcb.freedesktop.org/) installed. Then run this in your command-line:
 
 ```
-gcc gst-play-mod.c -o gst-play-mod-1.0 `pkg-config --cflags --libs gstreamer-1.0 gstreamer-tag-1.0 gstreamer-pbutils-1.0 xcb` -lm
+gcc gst-play-mod.c -o gst-play-mod-1.0 `pkg-config --cflags --libs gstreamer-1.0 gstreamer-pbutils-1.0 xcb` -lm
 ```
 
 # What is the license ?

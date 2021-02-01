@@ -25,7 +25,6 @@
 #include <gst/audio/audio.h>
 #include <gst/video/video.h>
 #include <gst/pbutils/pbutils.h>
-#include <gst/tag/tag.h>
 #include <gst/math-compat.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1059,9 +1058,7 @@ play_cycle_track_selection (GstPlay * play, GstPlayTrackType track_type)
       g_signal_emit_by_name (play->playbin, prop_get, cur, &tags);
 
       if (tags != NULL) {
-        if (gst_tag_list_get_string (tags, GST_TAG_LANGUAGE_CODE, &lcode))
-          lang = gst_tag_get_language_name (lcode);
-        else if (gst_tag_list_get_string (tags, GST_TAG_LANGUAGE_NAME, &lname))
+        if (gst_tag_list_get_string (tags, GST_TAG_LANGUAGE_NAME, &lname))
           lang = lname;
         gst_tag_list_unref (tags);
       }
