@@ -111,23 +111,28 @@ static void relative_seek (GstPlay * play, gdouble percent);
 static void
 create_window (GstBus * bus, GstMessage * message, GstPipeline * pipeline)
 {
-  xcb_connection_t *c;
+  xcb_connection_t *connection;
   xcb_screen_t     *screen;
-  xcb_window_t      win;
+  xcb_window_t     window;
+  uint32_t         values[2];
 
-  c = xcb_connect (NULL, NULL);
-  screen = xcb_setup_roots_iterator (xcb_get_setup (c)).data;
-  win = xcb_generate_id(c);
+  connection = xcb_connect (NULL, NULL);
+  screen = xcb_setup_roots_iterator (xcb_get_setup (connection)).data;
+  window = xcb_generate_id(connection);
 
-  xcb_create_window (c, XCB_COPY_FROM_PARENT, win, screen->root, 0, 0,
-    screen->width_in_pixels, screen->height_in_pixels, 0,
-    XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0, NULL);
+  values[0] = screen->black_pixel;
+  values[1] = XCB_EVENT_MASK_EXPOSURE;
 
-  xcb_map_window (c, win);
-  xcb_flush (c);
+  xcb_create_window (connection, XCB_COPY_FROM_PARENT, window, screen->root,
+    0, 0, screen->width_in_pixels, screen->height_in_pixels, 0,
+    XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual,
+    XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK, values);
+
+  xcb_map_window (connection, window);
+  xcb_flush (connection);
 
   gst_video_overlay_set_window_handle (
-    GST_VIDEO_OVERLAY (GST_MESSAGE_SRC (message)), win);
+    GST_VIDEO_OVERLAY (GST_MESSAGE_SRC (message)), window);
 }
 
 static void
