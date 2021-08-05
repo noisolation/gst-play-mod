@@ -25,13 +25,19 @@
 #include <gst/audio/audio.h>
 #include <gst/video/video.h>
 #include <gst/math-compat.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 #include <xcb/xcb.h>
 
 #include <glib/gprintf.h>
+
+#include <dbus/dbus.h>
+#include <dbus/dbus-glib-lowlevel.h>
+#include <gio/gio.h>
 
 #define PROGRAM_NAME "gst-play-mod"
 #define VERSION_STRING "1.0"
@@ -40,6 +46,9 @@
 
 GST_DEBUG_CATEGORY (play_debug);
 #define GST_CAT_DEFAULT play_debug
+
+#define INTERFACE_NAME "com.noisolation.MediaPlayer"
+#define OBJECT_PATH "/com/noisolation/MediaPlayer"
 
 typedef enum
 {
@@ -80,6 +89,8 @@ typedef struct
   gboolean buffering;
   gboolean is_live;
 
+  GstState desired_state;
+
   gulong deep_notify_id;
 
   /* configuration */
@@ -99,14 +110,310 @@ static void play_about_to_finish (GstElement * playbin, gpointer user_data);
 static void play_reset (GstPlay * play);
 static void play_set_relative_volume (GstPlay * play, gdouble volume_step);
 static void play_set_playback_rate (GstPlay * play, gdouble rate);
-static gboolean play_do_seek (GstPlay * play, gint64 pos, gdouble rate,
-    GstPlayTrickMode mode);
+static void play_set_relative_playback_rate (GstPlay * play, gdouble rate_step, gboolean reverse_direction);
+static void play_switch_trick_mode (GstPlay * play);
+static void play_cycle_track_selection (GstPlay * play, GstPlayTrackType track_type);
+static void play_toggle_audio_mute (GstPlay * play);
+static gboolean play_do_seek (GstPlay * play, gint64 pos, gdouble rate, GstPlayTrickMode mode);
+static void toggle_paused (GstPlay * play);
+static void relative_seek (GstPlay * play, gdouble percent);
 
 /* *INDENT-OFF* */
 static void gst_play_printf (const gchar * format, ...) G_GNUC_PRINTF (1, 2);
 /* *INDENT-ON* */
 
-static void relative_seek (GstPlay * play, gdouble percent);
+static DBusHandlerResult
+server_get_properties_handler (const char *property, DBusConnection *conn, DBusMessage *reply)
+{
+  if (!strcmp (property, "Version")) {
+    dbus_message_append_args (reply, DBUS_TYPE_STRING, VERSION_STRING, DBUS_TYPE_INVALID);
+  } else {
+    return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+  }
+
+  if (!dbus_connection_send (conn, reply, NULL)) {
+    return DBUS_HANDLER_RESULT_NEED_MEMORY;
+  }
+
+  return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+static DBusHandlerResult
+server_get_all_properties_handler (DBusConnection *conn, DBusMessage *reply)
+{
+  DBusHandlerResult result;
+  DBusMessageIter array, dict, iter, variant;
+  const char *property = "Version";
+  const char *version = VERSION_STRING;
+
+  result = DBUS_HANDLER_RESULT_NEED_MEMORY;
+
+  dbus_message_iter_init_append (reply, &iter);
+  dbus_message_iter_open_container (&iter, DBUS_TYPE_ARRAY, "{sv}", &array);
+
+  dbus_message_iter_open_container (&array, DBUS_TYPE_DICT_ENTRY, NULL, &dict);
+  dbus_message_iter_append_basic (&dict, DBUS_TYPE_STRING, &property);
+  dbus_message_iter_open_container (&dict, DBUS_TYPE_VARIANT, "s", &variant);
+  dbus_message_iter_append_basic (&variant, DBUS_TYPE_STRING, &version);
+  dbus_message_iter_close_container (&dict, &variant);
+  dbus_message_iter_close_container (&array, &dict);
+  
+  dbus_message_iter_close_container (&iter, &array);
+
+  if (dbus_connection_send (conn, reply, NULL)) {
+    result = DBUS_HANDLER_RESULT_HANDLED;
+  }
+
+  return result;
+}
+
+static DBusHandlerResult
+server_message_handler (DBusConnection *conn, DBusMessage *message, void *user_data)
+{
+  DBusHandlerResult result;
+  DBusMessage *reply = NULL;
+  DBusError err;
+  bool quit = false;
+  GstPlay *play = (GstPlay *) user_data;
+
+  gst_printerr ("Got D-Bus request: %s.%s on %s\n",
+    dbus_message_get_interface (message),
+    dbus_message_get_member (message),
+    dbus_message_get_path (message));
+
+  dbus_error_init (&err);
+
+  if (dbus_message_is_method_call (message, DBUS_INTERFACE_PROPERTIES, "Get")) {
+    const char *interface, *property;
+
+    if (!dbus_message_get_args (message, &err,
+        DBUS_TYPE_STRING, &interface,
+        DBUS_TYPE_STRING, &property,
+        DBUS_TYPE_INVALID)) {
+      goto fail;
+    }
+
+    if (!(reply = dbus_message_new_method_return (message)))
+      goto fail;
+
+    result = server_get_properties_handler (property, conn, reply);
+    dbus_message_unref (reply);
+    return result;
+
+  } else if (dbus_message_is_method_call (message, DBUS_INTERFACE_PROPERTIES, "GetAll")) {
+
+    if (!(reply = dbus_message_new_method_return (message)))
+      goto fail;
+
+    result = server_get_all_properties_handler (conn, reply);
+    dbus_message_unref (reply);
+    
+    return result;
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "Quit")) {
+
+    reply = dbus_message_new_method_return (message);
+    quit  = true;
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "TogglePaused")) {
+
+    reply = dbus_message_new_method_return (message);
+    toggle_paused (play);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "PlayNext")) {
+
+    reply = dbus_message_new_method_return (message);
+    if (!play_next (play)) {
+      gst_print ("\n%s\n", "Reached end of play list.");
+        quit = true;
+      }
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "PlayPrevious")) {
+
+    reply = dbus_message_new_method_return (message);
+    play_prev (play);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "IncreasePlaybackRate")) {
+
+    reply = dbus_message_new_method_return (message);
+
+    if (play->rate > -0.2 && play->rate < 0.0)
+      play_set_relative_playback_rate (play, 0.0, TRUE);
+    else if (ABS (play->rate) < 2.0)
+      play_set_relative_playback_rate (play, 0.1, FALSE);
+    else if (ABS (play->rate) < 4.0)
+      play_set_relative_playback_rate (play, 0.5, FALSE);
+    else
+      play_set_relative_playback_rate (play, 1.0, FALSE);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "DecreasePlaybackRate")) {
+
+    reply = dbus_message_new_method_return (message);
+
+    if (play->rate > 0.0 && play->rate < 0.20)
+      play_set_relative_playback_rate (play, 0.0, TRUE);
+    else if (ABS (play->rate) <= 2.0)
+      play_set_relative_playback_rate (play, -0.1, FALSE);
+    else if (ABS (play->rate) <= 4.0)
+      play_set_relative_playback_rate (play, -0.5, FALSE);
+    else
+      play_set_relative_playback_rate (play, -1.0, FALSE);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "ChangePlaybackDirection")) {
+
+    reply = dbus_message_new_method_return (message);
+    play_set_relative_playback_rate (play, 0.0, TRUE);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "ToggleTrickMode")) {
+
+    reply = dbus_message_new_method_return (message);
+    play_switch_trick_mode (play);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "ChangeAudioTrack")) {
+
+    reply = dbus_message_new_method_return (message);
+    play_cycle_track_selection (play, GST_PLAY_TRACK_TYPE_AUDIO);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "ChangeVideoTrack")) {
+
+    reply = dbus_message_new_method_return (message);
+    play_cycle_track_selection (play, GST_PLAY_TRACK_TYPE_VIDEO);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "ChangeSubtitleTrack")) {
+
+    reply = dbus_message_new_method_return (message);
+    play_cycle_track_selection (play, GST_PLAY_TRACK_TYPE_SUBTITLE);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "SeekToBeginning")) {
+
+    reply = dbus_message_new_method_return (message);
+    play_do_seek (play, 0, play->rate, play->trick_mode);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "ToggleAudioMute")) {
+
+    reply = dbus_message_new_method_return (message);
+    play_toggle_audio_mute (play);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "IncreaseAudioVolume")) {
+
+    reply = dbus_message_new_method_return (message);
+    play_set_relative_volume (play, +1.0 / VOLUME_STEPS);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "DecreaseAudioVolume")) {
+
+    reply = dbus_message_new_method_return (message);
+    play_set_relative_volume (play, -1.0 / VOLUME_STEPS);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "SeekRight")) {
+
+    reply = dbus_message_new_method_return (message);
+    relative_seek (play, +0.08);
+
+  } else if (dbus_message_is_method_call (message, INTERFACE_NAME, "SeekLeft")) {
+
+    reply = dbus_message_new_method_return (message);
+    relative_seek (play, +0.08);
+
+	} else {
+		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+  }
+
+fail:
+  if (dbus_error_is_set (&err)) {
+    if (reply) {
+      dbus_message_unref (reply);
+    }
+    reply = dbus_message_new_error (message, err.name, err.message);
+      dbus_error_free (&err);
+  }
+
+  if (!reply) {
+    return DBUS_HANDLER_RESULT_NEED_MEMORY;
+  }
+
+  result = DBUS_HANDLER_RESULT_HANDLED;
+  if (!dbus_connection_send (conn, reply, NULL)) {
+    result = DBUS_HANDLER_RESULT_NEED_MEMORY;
+  }
+  dbus_message_unref (reply);
+
+  if (quit) {
+    gst_printerr ("Server exiting...\n");
+    g_main_loop_quit (play->loop);
+  }
+
+  return result;
+}
+
+const DBusObjectPathVTable server_vtable = {
+  .message_function = server_message_handler
+};
+
+static gboolean
+server_setup(GstPlay *play)
+{
+  DBusConnection *dbus_conn;
+  DBusError dbus_err;
+  int rv;
+
+  dbus_error_init (&dbus_err);
+
+  dbus_conn = dbus_bus_get(DBUS_BUS_SESSION, &dbus_err);
+  if (!dbus_conn) {
+    gst_printerr ("Failed to get a session DBus connection: %s\n", dbus_err.message);
+    dbus_error_free (&dbus_err);
+    return FALSE;
+  }
+
+  rv = dbus_bus_request_name(dbus_conn, INTERFACE_NAME, DBUS_NAME_FLAG_REPLACE_EXISTING , &dbus_err);
+  if (rv != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
+    gst_printerr ("Failed to request name on bus: %s\n", dbus_err.message);
+    dbus_error_free (&dbus_err);
+    return FALSE;
+  }
+
+  if (!dbus_connection_register_object_path(dbus_conn, OBJECT_PATH, &server_vtable, play)) {
+    gst_printerr ("Failed to register a object path for MediaPlayer'\n");
+    dbus_error_free (&dbus_err);
+    return FALSE;
+  }
+
+  /* Set up the DBus connection to work in a GLib event loop */
+  dbus_connection_setup_with_g_main (dbus_conn, NULL);
+
+  return TRUE;
+}
+
+static void
+client_call_method(const char * method)
+{
+  GDBusProxy *proxy;
+  GDBusConnection *conn;
+  GVariant *result;
+  GError *error = NULL;
+
+  conn = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+  g_assert_no_error(error);
+
+  proxy = g_dbus_proxy_new_sync(conn,
+      G_DBUS_PROXY_FLAGS_NONE,
+      NULL,
+      INTERFACE_NAME,
+      OBJECT_PATH,
+      INTERFACE_NAME,
+      NULL,
+      &error);
+  g_assert_no_error(error);
+
+  result = g_dbus_proxy_call_sync(proxy, method, NULL,
+      G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
+  
+  g_assert_no_error(error);
+  g_variant_unref(result);
+
+  g_object_unref(proxy);
+  g_object_unref(conn);
+}
 
 static void
 create_window (GstBus * bus, GstMessage * message, GstPipeline * pipeline)
@@ -235,6 +542,8 @@ play_new (gchar ** uris, const gchar * audio_sink, const gchar * video_sink,
   play->buffering = FALSE;
   play->is_live = FALSE;
 
+  play->desired_state = GST_STATE_PLAYING;
+
   play->gapless = gapless;
   if (gapless) {
     g_signal_connect (play->playbin, "about-to-finish",
@@ -305,6 +614,23 @@ play_set_relative_volume (GstPlay * play, gdouble volume_step)
       GST_STREAM_VOLUME_FORMAT_CUBIC, volume);
 
   gst_print ("Volume: %.0f%%", volume * 100);
+  gst_print ("                  \n");
+}
+
+static void
+play_toggle_audio_mute (GstPlay * play)
+{
+  gboolean mute;
+
+  mute = gst_stream_volume_get_mute (GST_STREAM_VOLUME (play->playbin));
+
+  mute = !mute;
+  gst_stream_volume_set_mute (GST_STREAM_VOLUME (play->playbin), mute);
+
+  if (mute)
+    gst_print ("Mute: on");
+  else
+    gst_print ("Mute: off");
   gst_print ("                  \n");
 }
 
@@ -749,6 +1075,21 @@ shuffle_uris (gchar ** uris, guint num)
 }
 
 static void
+toggle_paused (GstPlay * play)
+{
+  if (play->desired_state == GST_STATE_PLAYING)
+    play->desired_state = GST_STATE_PAUSED;
+  else
+    play->desired_state = GST_STATE_PLAYING;
+
+  if (!play->buffering) {
+    gst_element_set_state (play->playbin, play->desired_state);
+  } else if (play->desired_state == GST_STATE_PLAYING) {
+    gst_print ("\nWill play as soon as buffering finishes)\n");
+  }
+}
+
+static void
 relative_seek (GstPlay * play, gdouble percent)
 {
   GstQuery *query;
@@ -958,44 +1299,6 @@ play_switch_trick_mode (GstPlay * play)
   }
 }
 
-static GstStream *
-play_get_nth_stream_in_collection (GstPlay * play, guint index,
-    GstPlayTrackType track_type)
-{
-  guint len, i, n_streams = 0;
-  GstStreamType target_type;
-
-  switch (track_type) {
-    case GST_PLAY_TRACK_TYPE_AUDIO:
-      target_type = GST_STREAM_TYPE_AUDIO;
-      break;
-    case GST_PLAY_TRACK_TYPE_VIDEO:
-      target_type = GST_STREAM_TYPE_VIDEO;
-      break;
-    case GST_PLAY_TRACK_TYPE_SUBTITLE:
-      target_type = GST_STREAM_TYPE_TEXT;
-      break;
-    default:
-      return NULL;
-  }
-
-  len = gst_stream_collection_get_size (play->collection);
-
-  for (i = 0; i < len; i++) {
-    GstStream *stream = gst_stream_collection_get_stream (play->collection, i);
-    GstStreamType type = gst_stream_get_stream_type (stream);
-
-    if (type & target_type) {
-      if (index == n_streams)
-        return stream;
-
-      n_streams++;
-    }
-  }
-
-  return NULL;
-}
-
 static void
 play_cycle_track_selection (GstPlay * play, GstPlayTrackType track_type)
 {
@@ -1005,9 +1308,6 @@ play_cycle_track_selection (GstPlay * play, GstPlayTrackType track_type)
 
   /* playbin3 variables */
   GList *selected_streams = NULL;
-  gint cur_audio_idx = -1, cur_video_idx = -1, cur_text_idx = -1;
-  gint nb_audio = 0, nb_video = 0, nb_text = 0;
-  guint len, i;
 
   switch (track_type) {
     case GST_PLAY_TRACK_TYPE_AUDIO:
@@ -1111,6 +1411,7 @@ main (int argc, char **argv)
   GError *err = NULL;
   GOptionContext *ctx;
   gchar *playlist_file = NULL;
+  gchar *rpc = NULL;
   GOptionEntry options[] = {
     {"verbose", 'v', 0, G_OPTION_ARG_NONE, &verbose,
         "Output status information and property notifications", NULL},
@@ -1135,6 +1436,8 @@ main (int argc, char **argv)
         "Playlist file containing input media files", NULL},
     {"quiet", 'q', 0, G_OPTION_ARG_NONE, &quiet,
         "Do not print any output (apart from errors)", NULL},
+    {"rpc", 0, 0, G_OPTION_ARG_STRING, &rpc,
+        "Do a dbus remote procedure call (requires running player)", NULL},
     {G_OPTION_REMAINING, 0, 0, G_OPTION_ARG_FILENAME_ARRAY, &filenames, NULL},
     {NULL}
   };
@@ -1172,6 +1475,12 @@ main (int argc, char **argv)
     return 0;
   }
 
+  /* DBus client */
+  if (rpc != NULL) {
+    client_call_method(rpc);
+    return 0;
+  }
+
   playlist = g_ptr_array_new ();
 
   if (playlist_file != NULL) {
@@ -1200,9 +1509,9 @@ main (int argc, char **argv)
 
   if (playlist->len == 0 && (filenames == NULL || *filenames == NULL)) {
     gst_printerr ("Usage: %s FILE1|URI1 [FILE2|URI2] [FILE3|URI3] ...",
-        g_get_prgname ());
+    g_get_prgname ());
     gst_printerr ("\n\n"),
-        gst_printerr ("%s\n\n",
+    gst_printerr ("%s\n\n",
         "You must provide at least one filename or URI to play.");
     /* No input provided. Free array */
     g_ptr_array_free (playlist, TRUE);
@@ -1238,6 +1547,13 @@ main (int argc, char **argv)
     gst_printerr
         ("Failed to create 'playbin' element. Check your GStreamer installation.\n");
     return EXIT_FAILURE;
+  }
+
+  /* Set up the DBus server */
+  if (!server_setup (play)) {
+	  gst_printerr
+        ("Failed to set up the DBus server.\n");
+	  return EXIT_FAILURE;
   }
 
   /* play */
