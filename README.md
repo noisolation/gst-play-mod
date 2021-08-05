@@ -5,6 +5,7 @@ This is a modified and somewhat stripped-down version of `gst-play-1.0` tool in 
 Added functionality:
 - playback rate command-line option
 - always opens in full-screen mode
+- dbus interface for commands
 
 Removed functionality:
 - keyboard and mouse input
@@ -17,10 +18,16 @@ We needed a simple player where we could adjust the playback rate from the comma
 
 # How do I compile it ?
 
-Make sure you have [GStreamer](https://gitlab.freedesktop.org/gstreamer) and [xcb](https://xcb.freedesktop.org/) installed. Then run this in your command-line:
+Make sure you have [GStreamer](https://gitlab.freedesktop.org/gstreamer), [xcb](https://xcb.freedesktop.org/), [dbus](https://github.com/freedesktop/dbus) and [gio](https://gitlab.gnome.org/GNOME/glib/) installed. Then run this in your command-line:
 
 ```
-gcc gst-play-mod.c -o gst-play-mod-1.0 `pkg-config --cflags --libs gstreamer-1.0 gstreamer-audio-1.0 gstreamer-video-1.0 xcb` -lm
+gcc gst-play-mod.c -o gst-play-mod-1.0 `pkg-config --cflags --libs gstreamer-1.0 gstreamer-audio-1.0 gstreamer-video-1.0 xcb dbus-1 dbus-glib-1 gio-2.0` -lm
+```
+
+or simply
+
+```
+make
 ```
 
 # What is the license ?
